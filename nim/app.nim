@@ -1,41 +1,42 @@
-import server, asyncdispatch, asyncnet, strtabs, sequtils, times, os, strutils
+import asynchttpserver, asyncdispatch, asyncnet, strtabs, sequtils, times, os, strutils
 
 var previousUpdateTime = toInt(epochTime() * 1000)
 
-var clients: PClients
-new clients
-clients[] = @[]
-
 proc handleCORS(req: Request) {.async.} =
-  let headers = {"Access-Control-Allow-Origin": "*", "Connection": "close"}
+  await req.respond(Http204, "", newHttpHeaders({
+    "Access-Control-Allow-Origin": "*",
+    "Connection": "close"}))
 
-  await req.respond(Http204, "", headers.newStringTable())
-
-proc handleConnections(req: Request, clients: PClients) {.async.} =
+proc handleConnections(req: Request, clients: ref seq[AsyncSocket]) {.async.} =
   let clientCount = clients[].len
-  let headers = {"Content-Type": "text/plain", "Access-Control-Allow-Origin": "*",
-                 "Cache-Control": "no-cache", "Connection": "close"}
+  let headers = newHttpHeaders({"Content-Type": "text/plain",
+                                 "Access-Control-Allow-Origin": "*",
+                                 "Cache-Control": "no-cache",
+                                 "Connection": "close"})
 
-  await req.respond(Http200, $clientCount, headers.newStringTable())
+  await req.respond(Http200, $clientCount, headers)
   req.client.close()
 
 proc handle404(req: Request) {.async.} =
-  let headers = {"Content-Type": "text/plain", "Connection": "close"}
+  let headers = newHttpHeaders({"Content-Type": "text/plain",
+                                 "Connection": "close"})
 
-  await req.respond(Http404, "File not found", headers.newStringTable())
+  await req.respond(Http404, "File not found", headers)
   req.client.close()
 
-proc handleSSE(req: Request, clients: PClients) {.async.} =
-  let headers = {"Content-Type": "text/event-stream", "Access-Control-Allow-Origin": "*",
-                 "Cache-Control": "no-cache", "Connection": "keep-alive"}
+proc handleSSE(req: Request, clients: ref seq[AsyncSocket]) {.async.} =
+  let headers = newHttpHeaders({"Content-Type": "text/event-stream",
+                                 "Access-Control-Allow-Origin": "*",
+                                 "Cache-Control": "no-cache",
+                                 "Connection": "keep-alive"})
 
   await req.client.send("HTTP/1.1 200 OK\c\L")
-  await req.sendHeaders(headers.newStringTable())
+  await req.sendHeaders(headers)
   await req.client.send("\c\L:ok\n\n")
-  clients[].add req.client
+  clients[].add(req.client)
 
-proc requestCallback(req: Request, clients: PClients) {.async.} =
-  if req.reqMethod == "OPTIONS":
+proc requestCallback(req: Request, clients: ref seq[AsyncSocket]) {.async.} =
+  if req.reqMethod == HttpOptions:
     asyncCheck handleCORS(req)
   else:
     case req.url.path
@@ -43,31 +44,30 @@ proc requestCallback(req: Request, clients: PClients) {.async.} =
     of "/sse": asyncCheck handleSSE(req, clients)
     else: asyncCheck handle404(req)
 
-proc pingClients(clients: PClients) {.async.} =
+proc pingClients(clients: ref seq[AsyncSocket]) {.async.} =
   let currentTime = toInt(epochTime() * 1000)
 
   if currentTime - previousUpdateTime < 1000: return
 
   for client in clients[]:
-    if not client.closed:
+    if not client.isClosed():
       asyncCheck client.send("data: " & $currentTime & "\n\n")
 
   previousUpdateTime = toInt(epochTime() * 1000)
 
-proc checkClients() =
-  clients[] = clients[].filterIt(it.closed != true)
 
-when isMainModule:
-  var port: int
+proc main(port = 1942) =
+  var clients: ref seq[AsyncSocket]
+  new clients
 
-  if paramCount() == 1:
-    try: port = paramStr(1).parseInt()
-    except EInvalidValue: port = 1942
-  else: port = 1942
+  proc checkClients() =
+    clients[] = clients[].filterIt(not it.isClosed())
 
   let httpServer = newAsyncHttpServer(true)
 
-  asyncCheck httpServer.serve(Port(port), clients, requestCallback)
+  asyncCheck httpServer.serve(
+    Port(port),
+    proc (req: Request): Future[void] = requestCallback(req, clients))
 
   echo "Listening on http://127.0.0.1:" & $port
 
@@ -75,3 +75,6 @@ when isMainModule:
     checkClients()
     asyncCheck pingClients(clients)
     poll()
+
+when isMainModule:
+  main()
